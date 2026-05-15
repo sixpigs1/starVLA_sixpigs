@@ -165,11 +165,25 @@ class Qwen_PI(baseframework):
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
     def _encode_vl_hidden_states(
-        self, batch_images: List, instructions: List[str]
-    ) -> List[torch.Tensor]:
-        """Run QwenVL and return the last-N layer-wise hidden states for the Action DiT."""
+        self,
+        batch_images: List,
+        instructions: List[str],
+        solutions: Optional[List[Optional[str]]] = None,
+    ) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
+        """Run QwenVL and return the last-N layer-wise hidden states for the Action DiT.
+
+        Args:
+            batch_images: List of per-sample image lists.
+            instructions: List of task language strings.
+            solutions: Optional list of CoT supervision strings (bbox annotations).
+                       When provided, the VLM computes an LM loss over the solution tokens.
+
+        Returns:
+            vl_embs_list: List of hidden state tensors (one per DiT cross-attn layer).
+            vlm_cot_loss: Scalar LM loss on solution tokens, or None if solutions is None.
+        """
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-            images=batch_images, instructions=instructions
+            images=batch_images, instructions=instructions, solutions=solutions,
         )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
@@ -180,7 +194,12 @@ class Qwen_PI(baseframework):
             )
             expected_layers = len(self.action_model.model.transformer_blocks)
             vl_embs_list = list(qwenvl_outputs.hidden_states[-expected_layers:])
-        return vl_embs_list
+
+        vlm_cot_loss = None
+        if solutions is not None and qwenvl_outputs.loss is not None:
+            vlm_cot_loss = qwenvl_outputs.loss
+
+        return vl_embs_list, vlm_cot_loss
 
     def forward(
         self,
@@ -203,8 +222,16 @@ class Qwen_PI(baseframework):
 
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
 
-        # Step 1: encode through QwenVL
-        vl_embs_list = self._encode_vl_hidden_states(batch_images, instructions)
+        # === CoT solutions (supervised bbox annotations for E-2f) ===
+        solutions = [example.get("solution", None) for example in examples]
+        has_solutions = any(s is not None for s in solutions)
+        solutions_input = solutions if has_solutions else None
+        # ============================================================
+
+        # Step 1: encode through QwenVL (optionally with CoT supervision)
+        vl_embs_list, vlm_cot_loss = self._encode_vl_hidden_states(
+            batch_images, instructions, solutions=solutions_input
+        )
         base_hidden = vl_embs_list[-1]
 
         # Step 4: Action Expert Forward and Loss
@@ -236,7 +263,17 @@ class Qwen_PI(baseframework):
                 state_repeated,
             )  # (B, chunk_len, action_dim)
 
-        return {"action_loss": action_loss}
+        # === CoT loss: add weighted VLM language-modelling loss on bbox solutions ===
+        result = {"action_loss": action_loss}
+        if vlm_cot_loss is not None:
+            cot_weight = float(getattr(self.config.trainer, "cot_loss_weight", 0.1))
+            weighted_cot_loss = vlm_cot_loss * cot_weight
+            # Combine into action_loss so existing trainer works without modification
+            result["action_loss"] = action_loss + weighted_cot_loss
+            result["vlm_cot_loss"] = weighted_cot_loss.detach()
+        # ===========================================================================
+
+        return result
 
     @torch.inference_mode()
     def predict_action(  # TODO align  predict_action with forward, make api more flexible
@@ -268,8 +305,8 @@ class Qwen_PI(baseframework):
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
-        # Step 1: encode through QwenVL
-        vl_embs_list = self._encode_vl_hidden_states(batch_images, instructions)
+        # Step 1: encode through QwenVL (no solutions at inference time)
+        vl_embs_list, _ = self._encode_vl_hidden_states(batch_images, instructions)
         base_hidden = vl_embs_list[-1]
 
         state = (

@@ -1,0 +1,65 @@
+# E-4: ColorJitter data augmentation ablation
+# Same as E-1 two-stage but with VideoColorJitter augmentation on training images.
+# Tests if photometric augmentation helps generalisation in CALVIN.
+
+run_id: starvla_calvin_e4_aug
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: calvin_vla_bench
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenPI
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3.5-VL-0.8B-Instruct
+    attn_implementation: flash_attention_2
+  action_model:
+    action_dim: 7
+    state_dim: 8
+    action_horizon: 50
+    repeated_diffusion_steps: 2
+    num_inference_timesteps: 4
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_target_vision_tokens: 32
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+      attention_head_dim: 64
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: false
+    data_root_dir: playground/Datasets/calvin
+    data_mix: calvin_task_ABC_D_aug   # << CHANGE: augmented data mix (VideoColorJitter)
+    action_type: abs_eef
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+
+trainer:
+  max_train_steps: 25000
+  num_warmup_steps: 500
+  save_interval: 5000
+  eval_interval: 5000
+  gradient_clipping: 1.0
+  resume_from_checkpoint: results/Checkpoints/starvla_calvin_stage1/step_5000
+  freeze_modules: ''
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
